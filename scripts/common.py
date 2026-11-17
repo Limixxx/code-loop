@@ -89,6 +89,10 @@ def load_config_from_env(env_path: Optional[str] = None,
     if param_defs is None:
         param_defs = _PARAM_DEFS_BASE
     file_env = _load_env_file(env_path)
+    # .env 中的 GH_TOKEN 显式覆盖进程环境变量（如任务里注入的 GH_TOKEN 可能无仓库权限），
+    # 保证 gh 命令使用配置文件中指定的凭据
+    if file_env.get("GH_TOKEN"):
+        os.environ["GH_TOKEN"] = file_env["GH_TOKEN"]
     config: Dict[str, Any] = {}
     for key, (default, _req, _desc) in param_defs.items():
         if key in os.environ:
@@ -110,8 +114,12 @@ def load_config_from_env(env_path: Optional[str] = None,
 # 底层命令封装
 # ============================================================
 
-def _run_gh(args: list, repo: Optional[str] = None) -> str:
-    """执行 gh 命令，返回 stdout。"""
+def _run_gh(args: list, repo: Optional[str] = None) -> Optional[str]:
+    """执行 gh 命令，返回 stdout。
+
+    命令执行失败（非 0 返回码 / 超时 / 未安装）时返回 None，
+    与“命令成功但输出为空”区分开，避免调用方把失败误判为“无数据”。
+    """
     cmd = ["gh"] + args
     if repo:
         cmd += ["--repo", repo]
@@ -120,10 +128,15 @@ def _run_gh(args: list, repo: Optional[str] = None) -> str:
             cmd, capture_output=True, text=True, timeout=60,
             encoding="utf-8", errors="replace",
         )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout).strip()
+            print(f"WARN: gh command failed (rc={result.returncode}): "
+                  f"{' '.join(cmd)} => {err}", file=sys.stderr)
+            return None
         return result.stdout.strip()
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"WARN: gh command failed: {e}", file=sys.stderr)
-        return ""
+        return None
 
 
 def _run_git(args: list, cwd: Optional[str] = None, timeout: int = 60) -> (bool, str):
@@ -246,7 +259,8 @@ def flow_meta_read(issue_number: int, issue_docs_prefix: str,
     if not os.path.isfile(filepath):
         return {}
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
+        # utf-8-sig 同时兼容带 BOM 与不带 BOM 的文件；纯 utf-8 遇 BOM 会解析失败
+        with open(filepath, "r", encoding="utf-8-sig") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         print(f"WARN: Cannot read flow_meta.json: {e}", file=sys.stderr)
@@ -327,18 +341,22 @@ def gh_update_project_status(
 # ============================================================
 
 def gh_get_pr_state(repo: str, pr_number: int) -> str:
-    """获取 PR 状态。返回 merged / closed / open / ""。"""
+    """获取 PR 状态。返回 merged / closed / open / unknown。
+
+    unknown 表示查询失败（鉴权、网络、仓库权限等问题），
+    调用方必须按“无法确认状态”处理，不能当作无 PR。
+    """
     output = _run_gh([
         "pr", "view", str(pr_number),
         "--json", "state",
     ], repo)
     if not output:
-        return ""
+        return "unknown"
     try:
         data = json.loads(output)
-        return data.get("state", "").lower()
+        return data.get("state", "").lower() or "unknown"
     except json.JSONDecodeError:
-        return ""
+        return "unknown"
 
 
 def gh_get_pr_comments(repo: str, pr_number: int) -> str:
@@ -386,18 +404,39 @@ def gh_create_pr(repo: str, branch_name: str, title: str, body: str,
         return ""
 
 
-def pr_should_rerun(repo: str, pr_number: Optional[int]) -> str:
-    """判断 PR 是否需要重跑。返回 DONE / WAIT / RERUN / ABORT / FIRST。"""
+def pr_should_rerun(repo: str, pr_number: Optional[int],
+                    fallback_state: Optional[str] = None) -> str:
+    """判断 PR 是否需要重跑。返回 DONE / WAIT / RERUN / ABORT / UNKNOWN / FIRST。
+
+    Args:
+        repo: GitHub 仓库 (owner/name)
+        pr_number: flow_meta.json 中记录的 PR 编号
+        fallback_state: gh 查询失败时的兜底状态（通常取 flow_meta.json 中的
+            solution_pr_state / code_pr_state）；未提供时按 UNKNOWN 处理，
+            由调用方终止流程（fail-closed）。
+
+    UNKNOWN 与 FIRST 严格区分：FIRST 表示确实没有 PR 记录，
+    UNKNOWN 表示有 PR 记录但查询失败，绝不能继续生成新 PR。
+    """
     if not pr_number:
         return "FIRST"
     state = gh_get_pr_state(repo, pr_number)
+    if state == "unknown":
+        if fallback_state:
+            print(f"WARN: gh 查询 PR #{pr_number} 状态失败，回退使用 flow_meta 状态: "
+                  f"{fallback_state}", file=sys.stderr)
+            state = str(fallback_state).lower()
+        else:
+            print(f"ERROR: 无法确认 PR #{pr_number} 状态（gh 查询失败且无兜底状态）",
+                  file=sys.stderr)
+            return "UNKNOWN"
     if state == "merged":
         return "DONE"
     if state == "open":
         return "WAIT"
     if state == "closed":
         return "RERUN"
-    return "FIRST"
+    return "UNKNOWN"
 
 
 # ============================================================
