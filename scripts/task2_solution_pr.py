@@ -176,7 +176,16 @@ def phase_post(issue_number: int, config: Dict[str, Any], cwd: str) -> int:
         if not result[0]: 
             print("  FAIL: git add failed: ", result[1])
             return 1
-        result = _run_git(["commit", "-m", f"docs({branch_name}): add solution document"], cwd=cwd)
+
+        # 方案内容与上一轮完全一致时无 diff，普通 commit 会失败，且 0 diff 的
+        # 分支无法创建 PR（GitHub 拦截 No changes）。此时用空 commit 造出
+        # 有 commit 的分支，PR 可正常创建并走评审。
+        status_ok, status_out = _run_git(["status", "--porcelain"], cwd=cwd)
+        commit_cmd = ["commit", "-m", f"docs({branch_name}): add solution document"]
+        if status_ok and not status_out.strip():
+            print("  [INFO] 无文件变更，使用 --allow-empty 空提交创建 PR")
+            commit_cmd.insert(1, "--allow-empty")
+        result = _run_git(commit_cmd, cwd=cwd)
         if not result[0]: 
             print("  FAIL: git commit failed: ", result[1])
             return 1
