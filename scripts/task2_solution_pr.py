@@ -172,19 +172,26 @@ def phase_post(issue_number: int, config: Dict[str, Any], cwd: str) -> int:
             print(f"  FAIL: solution.md not found: {solution_path}", file=sys.stderr)
             return 1
 
+        use_empty_commit = False
         result = _run_git(["add", solution_path], cwd=cwd)
-        if not result[0]: 
-            print("  FAIL: git add failed: ", result[1])
-            return 1
+        if not result[0]:
+            # 方案文件路径被 .gitignore 忽略（如 docs/issue）时，不使用 -f 强制添加，
+            # 而是回退为 --allow-empty 空提交：0 文件修改但分支仍有 commit，PR 可正常创建。
+            print("  [WARN] git add failed (路径可能被 .gitignore 忽略):", result[1])
+            print("  [INFO] 回退为 --allow-empty 空提交创建 PR（不使用 -f 强制添加）")
+            use_empty_commit = True
 
         # 方案内容与上一轮完全一致时无 diff，普通 commit 会失败，且 0 diff 的
         # 分支无法创建 PR（GitHub 拦截 No changes）。此时用空 commit 造出
         # 有 commit 的分支，PR 可正常创建并走评审。
-        status_ok, status_out = _run_git(["status", "--porcelain"], cwd=cwd)
-        commit_cmd = ["commit", "-m", f"docs({branch_name}): add solution document"]
-        if status_ok and not status_out.strip():
-            print("  [INFO] 无文件变更，使用 --allow-empty 空提交创建 PR")
-            commit_cmd.insert(1, "--allow-empty")
+        if use_empty_commit:
+            commit_cmd = ["commit", "--allow-empty", "-m", f"docs({branch_name}): add solution document"]
+        else:
+            status_ok, status_out = _run_git(["status", "--porcelain"], cwd=cwd)
+            commit_cmd = ["commit", "-m", f"docs({branch_name}): add solution document"]
+            if status_ok and not status_out.strip():
+                print("  [INFO] 无文件变更，使用 --allow-empty 空提交创建 PR")
+                commit_cmd.insert(1, "--allow-empty")
         result = _run_git(commit_cmd, cwd=cwd)
         if not result[0]: 
             print("  FAIL: git commit failed: ", result[1])
