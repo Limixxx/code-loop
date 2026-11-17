@@ -246,7 +246,8 @@ def flow_meta_read(issue_number: int, issue_docs_prefix: str,
     if not os.path.isfile(filepath):
         return {}
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
+        # utf-8-sig 同时兼容带 BOM 与不带 BOM 的文件；纯 utf-8 遇 BOM 会解析失败
+        with open(filepath, "r", encoding="utf-8-sig") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         print(f"WARN: Cannot read flow_meta.json: {e}", file=sys.stderr)
